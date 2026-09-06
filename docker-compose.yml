@@ -1,0 +1,16 @@
+version: '3.9'
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: riskradar
+      POSTGRES_PASSWORD: riskradar
+      POSTGRES_DB: riskradar
+    ports:
+      - '5432:5432'
+    volumes:
+      - riskradar_pgdata:/var/lib/postgresql/data
+
+volumes:
+  riskradar_pgdata:

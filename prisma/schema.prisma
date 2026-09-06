@@ -1,0 +1,419 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Users & tenancy
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String?
+  name         String?
+  image        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships      WorkspaceMember[]
+  ownedWorkspaces  Workspace[]       @relation("WorkspaceOwner")
+  tasksCreated     Task[]            @relation("TaskCreatedBy")
+  auditLogs        AuditLog[]
+}
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+/// A Workspace is the billing + isolation boundary (one company's tenant).
+/// It is distinct from a Slack "team" — a workspace may exist before Slack
+/// is ever connected.
+model Workspace {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  ownerId   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner            User               @relation("WorkspaceOwner", fields: [ownerId], references: [id])
+  members          WorkspaceMember[]
+  slackInstallation SlackInstallation?
+  channels         Channel[]
+  projects         Project[]
+  slackMessages    SlackMessage[]
+  analysisRuns     AnalysisRun[]
+  risks            Risk[]
+  tasks            Task[]
+  integrations     Integration[]
+  subscription     Subscription?
+  usageRecords     Usage[]
+  auditLogs        AuditLog[]
+
+  @@index([slug])
+}
+
+model WorkspaceMember {
+  id          String        @id @default(cuid())
+  workspaceId String
+  userId      String
+  role        WorkspaceRole @default(MEMBER)
+  createdAt   DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Slack integration
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One Slack workspace installation per Risk Radar workspace. Tokens are
+/// encrypted at rest (see src/lib/encryption.ts) — never store plaintext.
+model SlackInstallation {
+  id              String   @id @default(cuid())
+  workspaceId     String   @unique
+  slackTeamId     String   @unique
+  slackTeamName   String
+  botUserId       String
+  botAccessToken  String // AES-256-GCM ciphertext, format iv:tag:ciphertext
+  scope           String
+  installedByUserId String?
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([slackTeamId])
+}
+
+model Channel {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  slackChannelId  String
+  name            String
+  isPrivate       Boolean  @default(false)
+  isSelected      Boolean  @default(false) // chosen for analysis during onboarding
+  projectId       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project       Project?       @relation(fields: [projectId], references: [id])
+  slackMessages SlackMessage[]
+
+  @@unique([workspaceId, slackChannelId])
+  @@index([workspaceId, isSelected])
+}
+
+enum RiskTrend {
+  IMPROVING
+  STABLE
+  INCREASING
+}
+
+model Project {
+  id          String    @id @default(cuid())
+  workspaceId String
+  name        String
+  description String?
+  trend       RiskTrend @default(STABLE)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  channels  Channel[]
+  risks     Risk[]
+
+  @@index([workspaceId])
+}
+
+/// Ingested Slack messages for selected channels. Only stored for
+/// workspaces that have consented via channel selection; deleted on
+/// disconnect (see lib/slack/disconnect.ts).
+model SlackMessage {
+  id             String   @id @default(cuid())
+  workspaceId    String
+  channelId      String
+  slackMessageTs String
+  slackUserId    String
+  userDisplayName String?
+  text           String   @db.Text
+  permalink      String?
+  postedAt       DateTime
+  createdAt      DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  channel   Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  evidence  RiskEvidence[]
+
+  @@unique([channelId, slackMessageTs])
+  @@index([workspaceId, postedAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Risk engine
+// ─────────────────────────────────────────────────────────────────────────
+
+enum AnalysisTrigger {
+  MANUAL
+  SLASH_COMMAND
+  MENTION
+  SCHEDULED
+  ONBOARDING
+}
+
+enum AnalysisStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// One execution of the risk-analysis pipeline over a batch of messages.
+/// Processed asynchronously by the worker (src/lib/jobs) — never inline in
+/// an HTTP request handler.
+model AnalysisRun {
+  id                String          @id @default(cuid())
+  workspaceId       String
+  status            AnalysisStatus  @default(PENDING)
+  trigger           AnalysisTrigger @default(MANUAL)
+  channelIds        String[]
+  messagesAnalyzed  Int             @default(0)
+  risksFound        Int             @default(0)
+  error             String?
+  requestedByUserId String?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime        @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  risks     Risk[]
+
+  @@index([workspaceId, status])
+}
+
+enum RiskType {
+  blocker
+  dependency
+  deadline_risk
+  ghost_work
+  decision_drift
+  customer_issue
+  resource_risk
+}
+
+enum RiskSeverity {
+  Low
+  Medium
+  High
+  Critical
+}
+
+enum RiskStatus {
+  NEW
+  INVESTIGATING
+  RESOLVED
+  IGNORED
+}
+
+model Risk {
+  id                String       @id @default(cuid())
+  workspaceId       String
+  projectId         String?
+  analysisRunId     String?
+  type              RiskType
+  severity          RiskSeverity
+  confidence        Float // 0.0 - 1.0, AI's confidence in this finding
+  title             String
+  description       String       @db.Text
+  affectedPeople    String[] // Slack display names / ids mentioned as involved
+  affectedDeadline  String? // free-text deadline reference, e.g. "Payment launch"
+  status            RiskStatus   @default(NEW)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project         Project?         @relation(fields: [projectId], references: [id])
+  analysisRun     AnalysisRun?     @relation(fields: [analysisRunId], references: [id])
+  evidence        RiskEvidence[]
+  recommendations Recommendation[]
+  tasks           Task[]
+
+  @@index([workspaceId, status])
+  @@index([workspaceId, severity])
+}
+
+/// Every risk must be traceable to real Slack content — evidence rows are
+/// the only place risk "proof" is allowed to live. The AI layer is never
+/// permitted to write evidence text that isn't a real message quote.
+model RiskEvidence {
+  id             String   @id @default(cuid())
+  riskId         String
+  slackMessageId String?
+  quote          String   @db.Text
+  sourceUserName String?
+  sourceTs       String?
+  createdAt      DateTime @default(now())
+
+  risk         Risk          @relation(fields: [riskId], references: [id], onDelete: Cascade)
+  slackMessage SlackMessage? @relation(fields: [slackMessageId], references: [id])
+
+  @@index([riskId])
+}
+
+model Recommendation {
+  id          String   @id @default(cuid())
+  riskId      String
+  text        String
+  isCompleted Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  risk  Risk   @relation(fields: [riskId], references: [id], onDelete: Cascade)
+  tasks Task[]
+
+  @@index([riskId])
+}
+
+enum TaskIntegrationType {
+  INTERNAL
+  GITHUB
+  JIRA
+  LINEAR
+}
+
+enum TaskStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+}
+
+model Task {
+  id               String              @id @default(cuid())
+  workspaceId      String
+  riskId           String?
+  recommendationId String?
+  title            String
+  description      String?             @db.Text
+  assignee         String?
+  status           TaskStatus          @default(OPEN)
+  integrationType  TaskIntegrationType @default(INTERNAL)
+  externalUrl      String?
+  externalId       String?
+  createdByUserId  String?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  workspace      Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  risk           Risk?           @relation(fields: [riskId], references: [id])
+  recommendation Recommendation? @relation(fields: [recommendationId], references: [id])
+  createdBy      User?           @relation("TaskCreatedBy", fields: [createdByUserId], references: [id])
+
+  @@index([workspaceId, status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Third-party integrations (GitHub now; Jira/Linear later — same shape)
+// ─────────────────────────────────────────────────────────────────────────
+
+enum IntegrationType {
+  GITHUB
+  JIRA
+  LINEAR
+}
+
+model Integration {
+  id                  String          @id @default(cuid())
+  workspaceId         String
+  type                IntegrationType
+  accessToken         String // encrypted, same scheme as SlackInstallation
+  externalAccountId   String?
+  externalAccountName String?
+  defaultRepo         String? // e.g. "org/repo" for GitHub
+  scope               String?
+  isActive            Boolean         @default(true)
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, type])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Billing
+// ─────────────────────────────────────────────────────────────────────────
+
+enum PlanTier {
+  TRIAL
+  PRO
+  BUSINESS
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+}
+
+model Subscription {
+  id                   String             @id @default(cuid())
+  workspaceId          String             @unique
+  stripeCustomerId     String?            @unique
+  stripeSubscriptionId String?            @unique
+  plan                 PlanTier           @default(TRIAL)
+  status               SubscriptionStatus @default(TRIALING)
+  currentPeriodEnd     DateTime?
+  trialEndsAt          DateTime?
+  cancelAtPeriodEnd    Boolean            @default(false)
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+}
+
+/// Monthly rollup used to enforce fair-use / plan limits server-side.
+model Usage {
+  id               String   @id @default(cuid())
+  workspaceId      String
+  period           String // "YYYY-MM"
+  analysesCount    Int      @default(0)
+  messagesIngested Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, period])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Audit
+// ─────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  workspaceId String?
+  userId      String?
+  action      String // e.g. "slack.disconnect", "risk.status_changed"
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User?      @relation(fields: [userId], references: [id])
+
+  @@index([workspaceId, createdAt])
+}
